@@ -290,9 +290,20 @@ for d in "${DIRS[@]}"; do
     fi
 done
 
-# Fix ownership
+# Fix ownership and permissions — full read/write for pi user on all directories
 chown -R "$PI_USER":"$PI_USER" "$MOUNT_POINT" || warn "chown failed on some files — check permissions"
 success "Ownership set to $PI_USER:$PI_USER on $MOUNT_POINT"
+
+# Set directories to 775 (rwxrwxr-x) and files to 664 (rw-rw-r--)
+find "$MOUNT_POINT" -type d -exec chmod 775 {} \;
+find "$MOUNT_POINT" -type f -exec chmod 664 {} \;
+# Set SGID on all directories so new files inherit group ownership
+find "$MOUNT_POINT" -type d -exec chmod g+s {} \;
+success "Permissions set: dirs=775+sgid, files=664 on $MOUNT_POINT"
+
+# Also fix USB base dir
+chmod 775 "$USB_BASE"
+chown "$PI_USER":"$PI_USER" "$USB_BASE"
 
 # Verify write access
 TEST_FILE="$MOUNT_POINT/.naviyantra_write_test"
@@ -448,17 +459,40 @@ fi
 # SECTION 10 — N8N DIRECTORIES (deployment deferred)
 # =============================================================================
 
-section "10 · n8n directories"
+section "10 · n8n"
 
 if [[ "$INSTALL_N8N" -eq 1 ]]; then
+    N8N_NAME="n8n"
+
     mkdir -p "$MOUNT_POINT/n8n"
     mkdir -p "$MOUNT_POINT/docker/n8n/data"
     chown -R "$PI_USER":"$PI_USER" "$MOUNT_POINT/n8n" "$MOUNT_POINT/docker/n8n"
-    success "n8n directories created — deploy manually when ready:"
-    info "  docker run -d --name n8n --restart unless-stopped \\"
-    info "    -p 5678:5678 -e TZ=$TZ \\"
-    info "    -v $MOUNT_POINT/docker/n8n/data:/home/node/.n8n \\"
-    info "    n8nio/n8n"
+    chmod -R 775 "$MOUNT_POINT/n8n" "$MOUNT_POINT/docker/n8n"
+
+    if docker ps -a --format '{{.Names}}' | grep -q "^${N8N_NAME}$"; then
+        info "n8n container already exists — skipping"
+    else
+        docker pull n8nio/n8n:latest | tee -a "$LOG_FILE"
+
+        docker run -d \
+            --name "$N8N_NAME" \
+            --restart unless-stopped \
+            -p 5678:5678 \
+            -e TZ="$TZ" \
+            -e GENERIC_TIMEZONE="$TZ" \
+            -e N8N_BASIC_AUTH_ACTIVE=true \
+            -e N8N_BASIC_AUTH_USER=admin \
+            -e N8N_BASIC_AUTH_PASSWORD=naviyantra123 \
+            -v "$MOUNT_POINT/docker/n8n/data:/home/node/.n8n" \
+            -v "$MOUNT_POINT/n8n:/files" \
+            n8nio/n8n:latest
+
+        success "n8n started (port 5678)"
+        warn "n8n default login — user: admin  password: naviyantra123"
+        warn "Change it inside n8n Settings → Users after first login"
+    fi
+else
+    info "n8n skipped (INSTALL_N8N=0)"
 fi
 
 # =============================================================================
@@ -705,7 +739,7 @@ echo -e "${CYAN}Service URLs    :${RESET}"
 echo "  Syncthing   →  http://$PI_IP:8384"
 echo "  Portainer   →  http://$PI_IP:9000"
 echo "  OctoPrint   →  http://$PI_IP:5000"
-echo "  n8n (when deployed) → http://$PI_IP:5678"
+echo "  n8n         →  http://$PI_IP:5678  (admin / naviyantra123)"
 echo ""
 echo -e "${CYAN}Samba share     :${RESET}"
 echo "  \\\\$PI_IP\\Storage       (Linux: smb://$PI_IP/Storage)"
