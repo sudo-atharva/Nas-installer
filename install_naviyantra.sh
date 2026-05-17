@@ -1,80 +1,87 @@
 #!/usr/bin/env bash
 # =============================================================================
-# install_naviyantra.sh
-# Naviyantra Enterprises — Raspberry Pi NAS & Sync Environment Installer
-# Target: Raspberry Pi OS 64-bit Lite (Bookworm/Bullseye, Debian-based)
-# Author: Naviyantra Enterprises
-# Version: 1.0.0
+# install_naviyantra.sh — Naviyantra Enterprises Pi NAS Installer
+# Version: 2.0.0
+# Target:  Raspberry Pi OS 64-bit Lite (Bookworm)
 # =============================================================================
-# This script is IDEMPOTENT — safe to re-run on an existing installation.
-# It will skip steps already completed and update only what is needed.
+# WHAT THIS SCRIPT DOES (in order):
+#   1.  Installs all required system packages
+#   2.  Automatically detects & reformats BACKUP_HDD if corrupted
+#   3.  Mounts HDD at /mnt/storage with rw verified (hard fail if ro)
+#   4.  Writes fstab entry (UUID-based, nofail)
+#   5.  Creates systemd mount unit — HDD mounts BEFORE Docker on every boot
+#   6.  Makes Docker depend on that mount unit — no more lost volumes on reboot
+#   7.  Sets up USB automount via udev
+#   8.  Creates full directory structure with correct rw permissions
+#   9.  Installs Docker CE
+#   10. Deploys: Syncthing, Portainer, OctoPrint, n8n, Netdata
+#   11. Writes Syncthing .stignore (blocks .venv, node_modules, __pycache__)
+#   12. Configures Samba shares
+#   13. Tunes memory for 1 GB Pi + enables zram swap
+#   14. Installs naviyantra-health and naviyantra-status commands
+#   15. Copies installer to HDD for easy re-run
+#   16. Prints final summary with all URLs
+#
+# SAFE TO RE-RUN — idempotent throughout.
+# Set FORCE_REFORMAT=1 at top to force wipe even if drive looks healthy.
 # =============================================================================
 
 set -euo pipefail
 IFS=$'\n\t'
 
 # =============================================================================
-# CONFIGURATION — Edit these values to match your environment
+# CONFIGURATION — edit here
 # =============================================================================
 
-DRIVE_LABEL="BACKUP_HDD"                        # btrfs drive label
-MOUNT_POINT="/mnt/storage"                      # where the HDD is mounted
-PI_USER="pi"                                    # Linux user owning files
+DRIVE_LABEL="BACKUP_HDD"
+MOUNT_POINT="/mnt/storage"
+PI_USER="pi"
 PI_UID=1000
 PI_GID=1000
 TZ="Asia/Kolkata"
 SAMBA_SHARE_NAME="Storage"
 LOG_FILE="/var/log/naviyantra-setup.log"
 
-# Docker image tags
 SYNCTHING_IMAGE="lscr.io/linuxserver/syncthing:latest"
 PORTAINER_IMAGE="portainer/portainer-ce:latest"
 
-# Feature flags (set to 1 to enable)
-INSTALL_PORTAINER=1                             # set 0 to skip Portainer
-INSTALL_OCTOPRINT=1                             # set 0 to skip OctoPrint
-INSTALL_N8N=1                                   # set 0 to skip n8n
+INSTALL_PORTAINER=1
+INSTALL_OCTOPRINT=1
+INSTALL_N8N=1
+INSTALL_NETDATA=1
+
+# Set to 1 to force wipe+reformat even if drive is healthy
+FORCE_REFORMAT=0
 
 # =============================================================================
-# COLOUR HELPERS
+# COLOURS & LOGGING
 # =============================================================================
 
-RED='\033[0;31m'
-GREEN='\033[0;32m'
-YELLOW='\033[1;33m'
-CYAN='\033[0;36m'
-BOLD='\033[1m'
-RESET='\033[0m'
+RED='\033[0;31m'; GREEN='\033[0;32m'; YELLOW='\033[1;33m'
+CYAN='\033[0;36m'; BOLD='\033[1m'; RESET='\033[0m'
+
+mkdir -p "$(dirname "$LOG_FILE")"
+touch "$LOG_FILE"
+chmod 644 "$LOG_FILE"
 
 info()    { echo -e "${CYAN}[INFO]${RESET}  $*" | tee -a "$LOG_FILE"; }
 success() { echo -e "${GREEN}[OK]${RESET}    $*" | tee -a "$LOG_FILE"; }
 warn()    { echo -e "${YELLOW}[WARN]${RESET}  $*" | tee -a "$LOG_FILE"; }
 error()   { echo -e "${RED}[ERROR]${RESET} $*" | tee -a "$LOG_FILE"; exit 1; }
-section() { echo -e "\n${BOLD}${CYAN}══════════════════════════════════════════${RESET}" | tee -a "$LOG_FILE"
-            echo -e "${BOLD}${CYAN}  $*${RESET}" | tee -a "$LOG_FILE"
-            echo -e "${BOLD}${CYAN}══════════════════════════════════════════${RESET}" | tee -a "$LOG_FILE"; }
-
-# =============================================================================
-# PRE-FLIGHT
-# =============================================================================
-
-# Ensure log file is writable
-mkdir -p "$(dirname "$LOG_FILE")"
-touch "$LOG_FILE"
-chmod 644 "$LOG_FILE"
+section() {
+    echo -e "\n${BOLD}${CYAN}══════════════════════════════════════════${RESET}" | tee -a "$LOG_FILE"
+    echo -e "${BOLD}${CYAN}  $*${RESET}" | tee -a "$LOG_FILE"
+    echo -e "${BOLD}${CYAN}══════════════════════════════════════════${RESET}" | tee -a "$LOG_FILE"
+}
 
 echo "" | tee -a "$LOG_FILE"
 echo "================================================================" | tee -a "$LOG_FILE"
-echo " Naviyantra NAS Installer — $(date '+%Y-%m-%d %H:%M:%S')" | tee -a "$LOG_FILE"
+echo " Naviyantra NAS Installer v2.0 — $(date '+%Y-%m-%d %H:%M:%S')" | tee -a "$LOG_FILE"
 echo "================================================================" | tee -a "$LOG_FILE"
 
-# Must run as root
-[[ $EUID -eq 0 ]] || error "Please run as root: sudo bash $0"
-success "Running as root"
-
-# Confirm user exists
-id "$PI_USER" &>/dev/null || error "User '$PI_USER' does not exist. Create it first."
-success "User '$PI_USER' found"
+[[ $EUID -eq 0 ]] || error "Run as root: sudo bash $0"
+id "$PI_USER" &>/dev/null || error "User '$PI_USER' not found."
+success "Pre-flight OK"
 
 # =============================================================================
 # SECTION 1 — SYSTEM PACKAGES
@@ -82,187 +89,226 @@ success "User '$PI_USER' found"
 
 section "1 · Installing system packages"
 
-apt-get update -qq | tee -a "$LOG_FILE"
+apt-get update -qq 2>&1 | tee -a "$LOG_FILE"
 
 PKGS=(
-    btrfs-progs
-    samba
-    samba-common-bin
-    smartmontools
-    curl
-    git
-    htop
-    nano
-    usbutils
-    util-linux       # for lsblk / blkid
-    ca-certificates
-    gnupg
-    lsb-release
-    avahi-daemon     # mDNS — pi.local hostname
-    ntfs-3g          # NTFS USB drive support
-    exfatprogs       # exFAT USB drive support
-    udiskie          # optional USB automount helper
+    btrfs-progs samba samba-common-bin smartmontools
+    curl git htop nano usbutils util-linux
+    ca-certificates gnupg lsb-release
+    avahi-daemon ntfs-3g exfatprogs
 )
 
 for pkg in "${PKGS[@]}"; do
-    if dpkg -s "$pkg" &>/dev/null; then
+    if dpkg -s "$pkg" &>/dev/null 2>&1; then
         info "  already installed: $pkg"
     else
         info "  installing: $pkg"
-        apt-get install -y -qq "$pkg" | tee -a "$LOG_FILE"
+        apt-get install -y -qq "$pkg" 2>&1 | tee -a "$LOG_FILE"
         success "  installed: $pkg"
     fi
 done
 
 # =============================================================================
-# SECTION 2 — DETECT & MOUNT BACKUP_HDD (Btrfs)
+# SECTION 2 — FIND THE HDD
 # =============================================================================
 
-section "2 · Detecting and mounting $DRIVE_LABEL"
+section "2 · Locating $DRIVE_LABEL"
 
-# Find block device by label
 DRIVE_DEV=$(blkid -L "$DRIVE_LABEL" 2>/dev/null || true)
-
 if [[ -z "$DRIVE_DEV" ]]; then
-    # Fallback: scan all block devices for the label
     DRIVE_DEV=$(blkid | grep -i "LABEL=\"$DRIVE_LABEL\"" | awk -F: '{print $1}' | head -1 || true)
 fi
-
 if [[ -z "$DRIVE_DEV" ]]; then
-    warn "Drive with label '$DRIVE_LABEL' not found."
-    warn "Listing available block devices:"
-    lsblk -o NAME,FSTYPE,LABEL,UUID,MOUNTPOINT | tee -a "$LOG_FILE"
-    error "Please attach the HDD and re-run the installer."
+    warn "Drive '$DRIVE_LABEL' not found. Available devices:"
+    lsblk -o NAME,FSTYPE,LABEL,SIZE,MOUNTPOINT | tee -a "$LOG_FILE"
+    error "Attach the HDD and re-run."
+fi
+success "Found: $DRIVE_DEV"
+
+# =============================================================================
+# SECTION 3 — STOP CONTAINERS & UNMOUNT CLEANLY
+# =============================================================================
+
+section "3 · Stopping containers and unmounting HDD"
+
+if command -v docker &>/dev/null && systemctl is-active docker &>/dev/null 2>&1; then
+    RUNNING=$(docker ps -q 2>/dev/null || true)
+    if [[ -n "$RUNNING" ]]; then
+        info "Stopping running containers..."
+        docker stop $RUNNING 2>/dev/null || true
+        sleep 3
+    fi
 fi
 
-success "Found drive: $DRIVE_DEV"
+if mountpoint -q "$MOUNT_POINT" 2>/dev/null; then
+    info "Unmounting $MOUNT_POINT..."
+    umount -l "$MOUNT_POINT" 2>/dev/null || true
+    sleep 2
+fi
 
-# Get UUID for fstab (more stable than label)
-DRIVE_UUID=$(blkid -s UUID -o value "$DRIVE_DEV")
-DRIVE_FSTYPE=$(blkid -s TYPE -o value "$DRIVE_DEV")
-info "UUID: $DRIVE_UUID  |  FS: $DRIVE_FSTYPE"
+success "Clean slate ready"
 
-[[ "$DRIVE_FSTYPE" == "btrfs" ]] || error "Drive $DRIVE_DEV is $DRIVE_FSTYPE, not btrfs. Reformat or update DRIVE_LABEL."
+# =============================================================================
+# SECTION 4 — REFORMAT HDD IF NEEDED
+# =============================================================================
 
-# Create mount point
+section "4 · Filesystem check / reformat"
+
+DRIVE_FSTYPE=$(blkid -s TYPE -o value "$DRIVE_DEV" 2>/dev/null || true)
+NEEDS_FORMAT=0
+
+if [[ "$FORCE_REFORMAT" -eq 1 ]]; then
+    warn "FORCE_REFORMAT=1 — reformatting unconditionally"
+    NEEDS_FORMAT=1
+elif [[ "$DRIVE_FSTYPE" != "btrfs" ]]; then
+    warn "Drive is '$DRIVE_FSTYPE' not btrfs — reformatting"
+    NEEDS_FORMAT=1
+else
+    info "Running btrfs integrity check..."
+    if ! btrfs check --readonly "$DRIVE_DEV" &>/dev/null 2>&1; then
+        warn "btrfs check FAILED — filesystem corrupted — reformatting"
+        NEEDS_FORMAT=1
+    else
+        success "btrfs filesystem healthy — skipping reformat"
+    fi
+fi
+
+if [[ "$NEEDS_FORMAT" -eq 1 ]]; then
+    info "Formatting $DRIVE_DEV as btrfs (label: $DRIVE_LABEL)..."
+    mkfs.btrfs -f -L "$DRIVE_LABEL" "$DRIVE_DEV" 2>&1 | tee -a "$LOG_FILE"
+    sleep 2
+    blkid -c /dev/null "$DRIVE_DEV" &>/dev/null || true
+    success "Drive formatted"
+fi
+
+# =============================================================================
+# SECTION 5 — MOUNT & VERIFY RW
+# =============================================================================
+
+section "5 · Mounting HDD (rw required)"
+
 mkdir -p "$MOUNT_POINT"
 
-# Mount if not already mounted
-if mountpoint -q "$MOUNT_POINT"; then
-    success "$MOUNT_POINT already mounted"
-else
-    info "Mounting $DRIVE_DEV → $MOUNT_POINT"
-    mount -t btrfs -o defaults,noatime,compress=zstd "$DRIVE_DEV" "$MOUNT_POINT"
-    success "Mounted successfully"
+mount -t btrfs -o defaults,noatime,compress=zstd,rw "$DRIVE_DEV" "$MOUNT_POINT" \
+    2>&1 | tee -a "$LOG_FILE" || error "Mount failed — check cable/power and re-run"
+
+# Hard verify rw
+MOUNT_OPTS=$(mount | grep " $MOUNT_POINT " | grep -o '([^)]*)' || true)
+if echo "$MOUNT_OPTS" | grep -qw 'ro'; then
+    error "HDD mounted read-only after reformat. Unplug, replug and re-run."
 fi
+success "HDD mounted rw $MOUNT_OPTS"
+
+touch "$MOUNT_POINT/.naviyantra_write_test" && rm "$MOUNT_POINT/.naviyantra_write_test" \
+    || error "Write test failed — aborting"
+success "Write test passed"
 
 # =============================================================================
-# SECTION 3 — PERSISTENT FSTAB ENTRY
+# SECTION 6 — FSTAB
 # =============================================================================
 
-section "3 · Configuring /etc/fstab"
+section "6 · /etc/fstab"
 
-FSTAB_ENTRY="UUID=$DRIVE_UUID  $MOUNT_POINT  btrfs  defaults,noatime,compress=zstd,nofail  0  0"
+DRIVE_UUID=$(blkid -s UUID -o value "$DRIVE_DEV")
+info "UUID: $DRIVE_UUID"
 
-# Backup fstab once (don't overwrite repeated backups)
-if [[ ! -f /etc/fstab.naviyantra.bak ]]; then
-    cp /etc/fstab /etc/fstab.naviyantra.bak
-    info "fstab backed up → /etc/fstab.naviyantra.bak"
-fi
+[[ ! -f /etc/fstab.naviyantra.bak ]] && cp /etc/fstab /etc/fstab.naviyantra.bak
 
-if grep -qF "$DRIVE_UUID" /etc/fstab; then
-    info "fstab entry for UUID=$DRIVE_UUID already present — skipping"
-else
-    echo "" >> /etc/fstab
-    echo "# Naviyantra BACKUP_HDD — added by installer $(date '+%Y-%m-%d')" >> /etc/fstab
-    echo "$FSTAB_ENTRY" >> /etc/fstab
-    success "fstab entry added"
-fi
+# Remove any previous naviyantra entries (handles UUID change after reformat)
+grep -v -E "(Naviyantra BACKUP|$MOUNT_POINT.*btrfs)" /etc/fstab > /tmp/fstab.clean || true
+cp /tmp/fstab.clean /etc/fstab
 
-# Test fstab is valid
-mount -a --fake 2>/dev/null && success "fstab syntax OK" || warn "fstab --fake mount test reported an issue — review /etc/fstab"
+echo "" >> /etc/fstab
+echo "# Naviyantra BACKUP_HDD — $(date '+%Y-%m-%d')" >> /etc/fstab
+echo "UUID=$DRIVE_UUID  $MOUNT_POINT  btrfs  defaults,noatime,compress=zstd,nofail,x-systemd.device-timeout=30  0  0" >> /etc/fstab
+success "fstab updated (UUID=$DRIVE_UUID)"
 
 # =============================================================================
-# SECTION 4 — USB DRIVE AUTOMOUNT (udev rules)
+# SECTION 7 — SYSTEMD MOUNT UNIT (boot order fix)
 # =============================================================================
 
-section "4 · USB automount via udev"
+section "7 · Systemd mount unit — HDD before Docker on every boot"
 
-USB_MOUNT_SCRIPT="/usr/local/bin/naviyantra-automount.sh"
-UDEV_RULE="/etc/udev/rules.d/99-naviyantra-usb.rules"
+cat > /etc/systemd/system/mnt-storage.mount << UNIT
+[Unit]
+Description=Naviyantra BACKUP_HDD
+After=local-fs.target
+Before=docker.service
+
+[Mount]
+What=/dev/disk/by-uuid/$DRIVE_UUID
+Where=$MOUNT_POINT
+Type=btrfs
+Options=defaults,noatime,compress=zstd,nofail,x-systemd.device-timeout=30
+
+[Install]
+WantedBy=multi-user.target
+UNIT
+
+mkdir -p /etc/systemd/system/docker.service.d
+cat > /etc/systemd/system/docker.service.d/naviyantra-wait-for-hdd.conf << OVERRIDE
+[Unit]
+After=mnt-storage.mount
+Wants=mnt-storage.mount
+OVERRIDE
+
+systemctl daemon-reload
+systemctl enable mnt-storage.mount --quiet
+success "Boot order fixed: HDD mounts before Docker on every reboot"
+
+# =============================================================================
+# SECTION 8 — USB AUTOMOUNT
+# =============================================================================
+
+section "8 · USB automount via udev"
+
 USB_BASE="/mnt/usb"
 mkdir -p "$USB_BASE"
 
-cat > "$USB_MOUNT_SCRIPT" << 'SCRIPT'
+cat > /usr/local/bin/naviyantra-automount.sh << 'SCRIPT'
 #!/usr/bin/env bash
-# Naviyantra USB automount helper — called by udev
-# Mounts USB drives under /mnt/usb/<label_or_uuid>
-
-ACTION="$1"
-DEVNAME="$2"
-
+ACTION="$1"; DEVNAME="$2"
 USB_BASE="/mnt/usb"
 mkdir -p "$USB_BASE"
-
 if [[ "$ACTION" == "add" ]]; then
-    sleep 2   # let kernel settle
+    sleep 2
     LABEL=$(blkid -s LABEL -o value "$DEVNAME" 2>/dev/null || true)
-    UUID=$(blkid -s UUID  -o value "$DEVNAME" 2>/dev/null || true)
-    FSTYPE=$(blkid -s TYPE  -o value "$DEVNAME" 2>/dev/null || true)
-
-    # Skip swap, extended, unknown
+    UUID=$(blkid  -s UUID  -o value "$DEVNAME" 2>/dev/null || true)
+    FSTYPE=$(blkid -s TYPE -o value "$DEVNAME" 2>/dev/null || true)
     [[ -z "$FSTYPE" || "$FSTYPE" == "swap" ]] && exit 0
-
-    MOUNTNAME="${LABEL:-$UUID}"
-    MOUNTNAME="${MOUNTNAME// /_}"          # replace spaces
-    MOUNTDIR="$USB_BASE/$MOUNTNAME"
-    mkdir -p "$MOUNTDIR"
-
+    MNAME="${LABEL:-$UUID}"; MNAME="${MNAME// /_}"
+    MDIR="$USB_BASE/$MNAME"; mkdir -p "$MDIR"
     case "$FSTYPE" in
-        vfat|exfat)
-            mount -t "$FSTYPE" -o uid=1000,gid=1000,umask=022,nofail "$DEVNAME" "$MOUNTDIR" ;;
-        ntfs|ntfs-3g)
-            mount -t ntfs-3g -o uid=1000,gid=1000,umask=022,nofail "$DEVNAME" "$MOUNTDIR" ;;
-        btrfs)
-            mount -t btrfs -o defaults,noatime,compress=zstd,nofail "$DEVNAME" "$MOUNTDIR" ;;
-        ext4|ext3|ext2)
-            mount -t "$FSTYPE" -o defaults,noatime,nofail "$DEVNAME" "$MOUNTDIR" ;;
-        *)
-            mount -o defaults,nofail "$DEVNAME" "$MOUNTDIR" ;;
+        vfat|exfat)   mount -t "$FSTYPE"  -o uid=1000,gid=1000,umask=022,nofail "$DEVNAME" "$MDIR" ;;
+        ntfs|ntfs-3g) mount -t ntfs-3g    -o uid=1000,gid=1000,umask=022,nofail "$DEVNAME" "$MDIR" ;;
+        btrfs)        mount -t btrfs      -o defaults,noatime,compress=zstd,nofail "$DEVNAME" "$MDIR" ;;
+        ext*)         mount -t "$FSTYPE"  -o defaults,noatime,nofail "$DEVNAME" "$MDIR" ;;
+        *)            mount -o defaults,nofail "$DEVNAME" "$MDIR" ;;
     esac
-
-    logger "naviyantra-automount: mounted $DEVNAME ($FSTYPE) → $MOUNTDIR"
-
+    logger "naviyantra-automount: $DEVNAME ($FSTYPE) → $MDIR"
 elif [[ "$ACTION" == "remove" ]]; then
-    # Unmount any mountpoint that contains this device
     while IFS= read -r line; do
         MP=$(echo "$line" | awk '{print $2}')
-        umount "$MP" 2>/dev/null && rmdir "$MP" 2>/dev/null && \
-            logger "naviyantra-automount: unmounted $MP"
+        umount "$MP" 2>/dev/null && rmdir "$MP" 2>/dev/null || true
     done < <(grep "$DEVNAME" /proc/mounts || true)
 fi
 SCRIPT
 
-chmod +x "$USB_MOUNT_SCRIPT"
+chmod +x /usr/local/bin/naviyantra-automount.sh
 
-cat > "$UDEV_RULE" << UDEV
-# Naviyantra USB automount rules
-# Trigger on USB storage partition events
-ACTION=="add",    KERNEL=="sd[b-z][0-9]", SUBSYSTEM=="block", ENV{ID_BUS}=="usb", \
-    RUN+="/usr/local/bin/naviyantra-automount.sh add %N"
-
-ACTION=="remove", KERNEL=="sd[b-z][0-9]", SUBSYSTEM=="block", ENV{ID_BUS}=="usb", \
-    RUN+="/usr/local/bin/naviyantra-automount.sh remove %N"
+cat > /etc/udev/rules.d/99-naviyantra-usb.rules << 'UDEV'
+ACTION=="add",    KERNEL=="sd[b-z][0-9]", SUBSYSTEM=="block", ENV{ID_BUS}=="usb", RUN+="/usr/local/bin/naviyantra-automount.sh add %N"
+ACTION=="remove", KERNEL=="sd[b-z][0-9]", SUBSYSTEM=="block", ENV{ID_BUS}=="usb", RUN+="/usr/local/bin/naviyantra-automount.sh remove %N"
 UDEV
 
 udevadm control --reload-rules
-success "USB automount udev rules installed → $UDEV_RULE"
+success "USB automount ready"
 
 # =============================================================================
-# SECTION 5 — DIRECTORY STRUCTURE
+# SECTION 9 — DIRECTORY STRUCTURE & PERMISSIONS
 # =============================================================================
 
-section "5 · Creating directory structure"
+section "9 · Directories & permissions"
 
 DIRS=(
     "$MOUNT_POINT/Workplace"
@@ -270,9 +316,9 @@ DIRS=(
     "$MOUNT_POINT/docker/portainer/data"
     "$MOUNT_POINT/docker/octoprint/config"
     "$MOUNT_POINT/docker/n8n/data"
+    "$MOUNT_POINT/docker/netdata/config"
     "$MOUNT_POINT/backups/code_backup"
     "$MOUNT_POINT/backups/doc_backup"
-    "$MOUNT_POINT/printer"
     "$MOUNT_POINT/printer/uploads"
     "$MOUNT_POINT/printer/timelapses"
     "$MOUNT_POINT/downloads"
@@ -282,81 +328,68 @@ DIRS=(
 )
 
 for d in "${DIRS[@]}"; do
-    if [[ -d "$d" ]]; then
-        info "  exists: $d"
-    else
-        mkdir -p "$d"
-        success "  created: $d"
-    fi
+    mkdir -p "$d" && info "  ready: $d"
 done
 
-# Fix ownership and permissions — full read/write for pi user on all directories
-chown -R "$PI_USER":"$PI_USER" "$MOUNT_POINT" || warn "chown failed on some files — check permissions"
-success "Ownership set to $PI_USER:$PI_USER on $MOUNT_POINT"
-
-# Set directories to 775 (rwxrwxr-x) and files to 664 (rw-rw-r--)
+chown -R "$PI_USER":"$PI_USER" "$MOUNT_POINT"
 find "$MOUNT_POINT" -type d -exec chmod 775 {} \;
-find "$MOUNT_POINT" -type f -exec chmod 664 {} \;
-# Set SGID on all directories so new files inherit group ownership
 find "$MOUNT_POINT" -type d -exec chmod g+s {} \;
-success "Permissions set: dirs=775+sgid, files=664 on $MOUNT_POINT"
-
-# Also fix USB base dir
+find "$MOUNT_POINT" -type f -exec chmod 664 {} \;
 chmod 775 "$USB_BASE"
 chown "$PI_USER":"$PI_USER" "$USB_BASE"
 
-# Verify write access
-TEST_FILE="$MOUNT_POINT/.naviyantra_write_test"
-touch "$TEST_FILE" && rm "$TEST_FILE"
-success "Write access to $MOUNT_POINT confirmed"
+# Save installer to HDD — survives reinstalls
+cp "$0" "$MOUNT_POINT/install_naviyantra.sh" 2>/dev/null || true
+chmod 775 "$MOUNT_POINT/install_naviyantra.sh" 2>/dev/null || true
+
+success "Permissions OK (dirs=775+sgid, files=664, owner=$PI_USER)"
 
 # =============================================================================
-# SECTION 6 — DOCKER
+# SECTION 10 — DOCKER
 # =============================================================================
 
-section "6 · Installing Docker"
+section "10 · Docker"
 
 if command -v docker &>/dev/null; then
-    DOCKER_VER=$(docker --version)
-    info "Docker already installed: $DOCKER_VER"
+    info "Docker already installed: $(docker --version)"
 else
-    info "Installing Docker CE via official script..."
     curl -fsSL https://get.docker.com -o /tmp/get-docker.sh
-    sh /tmp/get-docker.sh | tee -a "$LOG_FILE"
+    sh /tmp/get-docker.sh 2>&1 | tee -a "$LOG_FILE"
     rm /tmp/get-docker.sh
     success "Docker installed"
 fi
 
-# Add pi user to docker group
-if groups "$PI_USER" | grep -q docker; then
-    info "$PI_USER already in docker group"
-else
-    usermod -aG docker "$PI_USER"
-    success "Added $PI_USER to docker group"
-fi
-
+groups "$PI_USER" | grep -q docker || usermod -aG docker "$PI_USER"
 systemctl enable docker --quiet
-systemctl start  docker
-success "Docker service running"
+systemctl start docker
+success "Docker running"
+
+# Helper — deploy only if container doesn't already exist
+deploy() {
+    local NAME="$1"; shift
+    if docker ps -a --format '{{.Names}}' | grep -q "^${NAME}$"; then
+        info "$NAME already exists — skipping"
+    else
+        info "Deploying $NAME..."
+        docker run -d "$@"
+        success "$NAME started"
+    fi
+}
 
 # =============================================================================
-# SECTION 7 — SYNCTHING CONTAINER
+# SECTION 11 — SYNCTHING
 # =============================================================================
 
-section "7 · Deploying Syncthing"
+section "11 · Syncthing"
 
-SYNCTHING_NAME="syncthing"
+# Always recreate Syncthing — fresh filesystem needs fresh config
+docker stop syncthing 2>/dev/null || true
+docker rm   syncthing 2>/dev/null || true
 
-if docker ps -a --format '{{.Names}}' | grep -q "^${SYNCTHING_NAME}$"; then
-    info "Syncthing container already exists — pulling latest image and recreating"
-    docker stop "$SYNCTHING_NAME"  || true
-    docker rm   "$SYNCTHING_NAME"  || true
-fi
-
-docker pull "$SYNCTHING_IMAGE" | tee -a "$LOG_FILE"
+docker pull "$SYNCTHING_IMAGE" 2>&1 | tee -a "$LOG_FILE"
 
 docker run -d \
-    --name "$SYNCTHING_NAME" \
+    --name syncthing \
     --restart unless-stopped \
     -e PUID="$PI_UID" \
     -e PGID="$PI_GID" \
@@ -369,153 +402,165 @@ docker run -d \
     -v "$MOUNT_POINT:/storage" \
     "$SYNCTHING_IMAGE"
 
-success "Syncthing container started"
+success "Syncthing started"
 
-# Verify container can see /storage/Workplace
+# Write .stignore to block problematic files from ever being synced
+info "Writing Syncthing ignore patterns..."
+sleep 5   # let container init
+
+STIGNORE="$MOUNT_POINT/Workplace/.stignore"
+cat > "$STIGNORE" << 'IGNORE'
+// Naviyantra — Syncthing ignore patterns
+// These paths are NEVER synced to/from this device
+
+// Python virtual environments (huge, platform-specific, always regenerate)
+.venv
+venv
+env
+.env
+__pycache__
+*.pyc
+*.pyo
+*.egg-info
+dist
+build
+.pytest_cache
+.mypy_cache
+*.so
+
+// Node.js
+node_modules
+.next
+.nuxt
+.cache
+dist
+build
+
+// Version control (do not double-sync git internals)
+.git
+
+// OS noise
+.DS_Store
+Thumbs.db
+desktop.ini
+
+// Logs and temp files
+*.log
+*.tmp
+*.swp
+*.bak
+~$*
+
+// Large files unlikely to need sync
+*.iso
+*.img
+*.vmdk
+*.ova
+IGNORE
+
+chown "$PI_USER":"$PI_USER" "$STIGNORE"
+chmod 664 "$STIGNORE"
+success "Syncthing .stignore written"
+
 sleep 3
-if docker exec "$SYNCTHING_NAME" ls /storage/Workplace &>/dev/null; then
-    success "Syncthing can see /storage/Workplace ✓"
-else
-    warn "Syncthing cannot see /storage/Workplace yet — if HDD was mounted after Docker started, run: docker restart syncthing"
-fi
+docker exec syncthing ls /storage/Workplace &>/dev/null \
+    && success "Syncthing sees /storage/Workplace ✓" \
+    || warn "Volume check pending — run: docker restart syncthing if UI shows error"
 
 # =============================================================================
-# SECTION 8 — PORTAINER (optional)
+# SECTION 12 — PORTAINER
 # =============================================================================
 
-section "8 · Portainer"
+section "12 · Portainer"
 
 if [[ "$INSTALL_PORTAINER" -eq 1 ]]; then
-    PORTAINER_NAME="portainer"
-
-    if docker ps -a --format '{{.Names}}' | grep -q "^${PORTAINER_NAME}$"; then
-        info "Portainer already running — skipping"
-    else
-        docker volume create portainer_data &>/dev/null || true
-        docker pull "$PORTAINER_IMAGE" | tee -a "$LOG_FILE"
-
-        docker run -d \
-            --name "$PORTAINER_NAME" \
-            --restart unless-stopped \
-            -p 9000:9000 \
-            -p 9443:9443 \
-            -v /var/run/docker.sock:/var/run/docker.sock \
-            -v portainer_data:/data \
-            "$PORTAINER_IMAGE"
-
-        success "Portainer started"
-    fi
-else
-    info "Portainer skipped (INSTALL_PORTAINER=0)"
+    deploy portainer \
+        --name portainer \
+        --restart unless-stopped \
+        -p 9000:9000 \
+        -p 9443:9443 \
+        -v /var/run/docker.sock:/var/run/docker.sock \
+        -v "$MOUNT_POINT/docker/portainer/data:/data" \
+        "$PORTAINER_IMAGE"
 fi
 
 # =============================================================================
-# SECTION 9 — OCTOPRINT CONTAINER (optional)
+# SECTION 13 — OCTOPRINT
 # =============================================================================
 
-section "9 · OctoPrint"
+section "13 · OctoPrint"
 
 if [[ "$INSTALL_OCTOPRINT" -eq 1 ]]; then
-    OCTOPRINT_NAME="octoprint"
-
-    if docker ps -a --format '{{.Names}}' | grep -q "^${OCTOPRINT_NAME}$"; then
-        info "OctoPrint already running — skipping"
-    else
-        docker pull octoprint/octoprint:latest | tee -a "$LOG_FILE"
-
-        # Expose printer USB device if present (adjust if device path differs)
-        PRINTER_DEV=""
-        for dev in /dev/ttyUSB0 /dev/ttyACM0; do
-            if [[ -c "$dev" ]]; then
-                PRINTER_DEV="$dev"
-                info "Found printer device: $PRINTER_DEV"
-                break
-            fi
-        done
-
-        DEVICE_ARG=""
-        [[ -n "$PRINTER_DEV" ]] && DEVICE_ARG="--device $PRINTER_DEV"
-
-        # shellcheck disable=SC2086
-        docker run -d \
-            --name "$OCTOPRINT_NAME" \
-            --restart unless-stopped \
-            -p 5000:5000 \
-            $DEVICE_ARG \
-            -e ENABLE_MJPG_STREAMER=true \
-            -v "$MOUNT_POINT/docker/octoprint/config:/octoprint" \
-            -v "$MOUNT_POINT/printer:/files" \
-            octoprint/octoprint:latest
-
-        success "OctoPrint started (port 5000)"
-        info "OctoPrint uploads → $MOUNT_POINT/printer/uploads"
-        info "OctoPrint timelapses → $MOUNT_POINT/printer/timelapses"
-    fi
-else
-    info "OctoPrint skipped (INSTALL_OCTOPRINT=0)"
+    # No --device flag — starts fine without printer, connect later via UI
+    deploy octoprint \
+        --name octoprint \
+        --restart unless-stopped \
+        -p 5000:5000 \
+        -e ENABLE_MJPG_STREAMER=true \
+        -v "$MOUNT_POINT/docker/octoprint/config:/octoprint" \
+        -v "$MOUNT_POINT/printer:/files" \
+        octoprint/octoprint:latest
 fi
 
 # =============================================================================
-# SECTION 10 — N8N DIRECTORIES (deployment deferred)
+# SECTION 14 — N8N
 # =============================================================================
 
-section "10 · n8n"
+section "14 · n8n"
 
 if [[ "$INSTALL_N8N" -eq 1 ]]; then
-    N8N_NAME="n8n"
+    deploy n8n \
+        --name n8n \
+        --restart unless-stopped \
+        -p 5678:5678 \
+        -e TZ="$TZ" \
+        -e GENERIC_TIMEZONE="$TZ" \
+        -e N8N_SECURE_COOKIE=false \
+        -e N8N_BASIC_AUTH_ACTIVE=true \
+        -e N8N_BASIC_AUTH_USER=admin \
+        -e N8N_BASIC_AUTH_PASSWORD=naviyantra123 \
+        -v "$MOUNT_POINT/docker/n8n/data:/home/node/.n8n" \
+        -v "$MOUNT_POINT/n8n:/files" \
+        n8nio/n8n:latest
 
-    mkdir -p "$MOUNT_POINT/n8n"
-    mkdir -p "$MOUNT_POINT/docker/n8n/data"
-    chown -R "$PI_USER":"$PI_USER" "$MOUNT_POINT/n8n" "$MOUNT_POINT/docker/n8n"
-    chmod -R 775 "$MOUNT_POINT/n8n" "$MOUNT_POINT/docker/n8n"
-
-    if docker ps -a --format '{{.Names}}' | grep -q "^${N8N_NAME}$"; then
-        info "n8n container already exists — skipping"
-    else
-        docker pull n8nio/n8n:latest | tee -a "$LOG_FILE"
-
-        docker run -d \
-            --name "$N8N_NAME" \
-            --restart unless-stopped \
-            -p 5678:5678 \
-            -e TZ="$TZ" \
-            -e GENERIC_TIMEZONE="$TZ" \
-            -e N8N_BASIC_AUTH_ACTIVE=true \
-            -e N8N_BASIC_AUTH_USER=admin \
-            -e N8N_BASIC_AUTH_PASSWORD=naviyantra123 \
-            -v "$MOUNT_POINT/docker/n8n/data:/home/node/.n8n" \
-            -v "$MOUNT_POINT/n8n:/files" \
-            n8nio/n8n:latest
-
-        success "n8n started (port 5678)"
-        warn "n8n default login — user: admin  password: naviyantra123"
-        warn "Change it inside n8n Settings → Users after first login"
-    fi
-else
-    info "n8n skipped (INSTALL_N8N=0)"
+    warn "n8n default login: admin / naviyantra123 — change after first login"
 fi
 
 # =============================================================================
-# SECTION 11 — SAMBA
+# SECTION 15 — NETDATA
 # =============================================================================
 
-section "11 · Configuring Samba"
+section "15 · Netdata"
+
+if [[ "$INSTALL_NETDATA" -eq 1 ]]; then
+    deploy netdata \
+        --name netdata \
+        --restart unless-stopped \
+        -p 19999:19999 \
+        --cap-add SYS_PTRACE \
+        --security-opt apparmor=unconfined \
+        -v /proc:/host/proc:ro \
+        -v /sys:/host/sys:ro \
+        -v /etc/os-release:/host/etc/os-release:ro \
+        -v /var/run/docker.sock:/var/run/docker.sock:ro \
+        netdata/netdata:latest
+fi
+
+# =============================================================================
+# SECTION 16 — SAMBA
+# =============================================================================
+
+section "16 · Samba"
 
 SMB_CONF="/etc/samba/smb.conf"
+[[ ! -f "${SMB_CONF}.naviyantra.bak" ]] && cp "$SMB_CONF" "${SMB_CONF}.naviyantra.bak"
 
-# Backup smb.conf once
-if [[ ! -f "${SMB_CONF}.naviyantra.bak" ]]; then
-    cp "$SMB_CONF" "${SMB_CONF}.naviyantra.bak"
-    info "smb.conf backed up → ${SMB_CONF}.naviyantra.bak"
-fi
-
-# Check if our share already exists
 if grep -q "\[$SAMBA_SHARE_NAME\]" "$SMB_CONF"; then
-    info "Samba share [$SAMBA_SHARE_NAME] already configured — skipping"
+    info "Samba shares already configured"
 else
     cat >> "$SMB_CONF" << SMB
 
-# Naviyantra NAS share — added by installer $(date '+%Y-%m-%d')
+# Naviyantra — $(date '+%Y-%m-%d')
 [$SAMBA_SHARE_NAME]
    comment = Naviyantra NAS Storage
    path = $MOUNT_POINT
@@ -538,235 +583,196 @@ else
    create mask = 0775
    directory mask = 0775
 SMB
-    success "Samba share [$SAMBA_SHARE_NAME] added"
+    success "Samba shares added"
 fi
 
-# Set Samba password for pi user (non-interactive: use a temp password, prompt user to change)
-SAMBA_PW_FILE="/root/.naviyantra_samba_pw_set"
-if [[ ! -f "$SAMBA_PW_FILE" ]]; then
-    DEFAULT_SAMBA_PASS="naviyantra123"
-    (echo "$DEFAULT_SAMBA_PASS"; echo "$DEFAULT_SAMBA_PASS") | smbpasswd -s -a "$PI_USER"
-    touch "$SAMBA_PW_FILE"
-    warn "Samba password set to default: $DEFAULT_SAMBA_PASS"
-    warn "CHANGE IT: sudo smbpasswd $PI_USER"
-else
-    info "Samba password already configured"
+if [[ ! -f /root/.naviyantra_samba_pw_set ]]; then
+    (echo "naviyantra123"; echo "naviyantra123") | smbpasswd -s -a "$PI_USER"
+    touch /root/.naviyantra_samba_pw_set
+    warn "Samba password: naviyantra123 — change with: sudo smbpasswd $PI_USER"
 fi
 
-# Validate smb.conf
-testparm -s "$SMB_CONF" &>/dev/null && success "smb.conf syntax OK" || warn "smb.conf has issues — check with: testparm"
-
+testparm -s "$SMB_CONF" &>/dev/null && success "smb.conf OK" || warn "smb.conf issue — run: testparm"
 systemctl enable smbd nmbd --quiet
 systemctl restart smbd nmbd
-success "Samba restarted"
+success "Samba running"
 
 # =============================================================================
-# SECTION 12 — MEMORY OPTIMISATION (1 GB Pi)
+# SECTION 17 — MEMORY TUNING
 # =============================================================================
 
-section "12 · Memory optimisation for 1 GB Pi"
+section "17 · Memory tuning"
 
 SYSCTL_CONF="/etc/sysctl.d/99-naviyantra.conf"
-
 if [[ ! -f "$SYSCTL_CONF" ]]; then
     cat > "$SYSCTL_CONF" << 'SYSCTL'
-# Naviyantra — tuned for 1 GB Raspberry Pi NAS
-vm.swappiness=10              # reduce swap usage
-vm.vfs_cache_pressure=50      # keep inode/dentry cache longer
-vm.dirty_background_ratio=5   # start writeback earlier
-vm.dirty_ratio=10             # cap dirty pages
+vm.swappiness=10
+vm.vfs_cache_pressure=50
+vm.dirty_background_ratio=5
+vm.dirty_ratio=10
 net.core.rmem_max=4194304
 net.core.wmem_max=4194304
 SYSCTL
-    sysctl -p "$SYSCTL_CONF" | tee -a "$LOG_FILE"
+    sysctl -p "$SYSCTL_CONF" 2>&1 | tee -a "$LOG_FILE"
     success "sysctl tuning applied"
 else
-    info "sysctl tuning already applied"
+    info "sysctl already tuned"
 fi
 
-# Enable zram swap for extra headroom (Bookworm: zram is built-in)
 if ! swapon --show | grep -q zram; then
-    if command -v zramctl &>/dev/null; then
-        ZRAM_SIZE="256M"
-        modprobe zram 2>/dev/null || true
-        zramctl /dev/zram0 --algorithm lz4 --size "$ZRAM_SIZE" 2>/dev/null || true
-        mkswap /dev/zram0 2>/dev/null && swapon -p 100 /dev/zram0 2>/dev/null && \
-            success "zram swap enabled (${ZRAM_SIZE})" || warn "zram setup skipped"
+    modprobe zram 2>/dev/null || true
+    if zramctl /dev/zram0 --algorithm lz4 --size 256M 2>/dev/null; then
+        mkswap /dev/zram0 &>/dev/null && swapon -p 100 /dev/zram0 &>/dev/null \
+            && success "zram swap enabled (256M)" || warn "zram swapon failed"
+    else
+        warn "zram unavailable on this kernel"
     fi
 else
     info "zram already active"
 fi
 
 # =============================================================================
-# SECTION 13 — HEALTH CHECK & STATUS SCRIPTS
+# SECTION 18 — HELPER COMMANDS
 # =============================================================================
 
-section "13 · Installing helper scripts"
+section "18 · Helper commands"
 
-# ── health check ─────────────────────────────────────────────────────────────
-HEALTH_SCRIPT="/usr/local/bin/naviyantra-health.sh"
-cat > "$HEALTH_SCRIPT" << 'HEALTH'
+cat > /usr/local/bin/naviyantra-health.sh << 'HEALTH'
 #!/usr/bin/env bash
-# Naviyantra health check
 RED='\033[0;31m'; GREEN='\033[0;32m'; YELLOW='\033[1;33m'; CYAN='\033[0;36m'; RESET='\033[0m'
 ok()   { echo -e "${GREEN}[OK]${RESET}   $*"; }
 fail() { echo -e "${RED}[FAIL]${RESET} $*"; ISSUES=$((ISSUES+1)); }
 warn() { echo -e "${YELLOW}[WARN]${RESET} $*"; }
 ISSUES=0
 
-echo -e "\n${CYAN}Naviyantra Health Check — $(date)${RESET}"
+echo -e "\n${CYAN}Naviyantra Health — $(date)${RESET}"
 
-# Disk
 echo -e "\n── Storage ──"
 if mountpoint -q /mnt/storage; then
     ok "/mnt/storage mounted"
     df -h /mnt/storage | tail -1
+    BTRFS_ERRS=$(dmesg 2>/dev/null | grep -c "BTRFS error" || echo 0)
+    [[ "$BTRFS_ERRS" -gt 0 ]] \
+        && fail "btrfs $BTRFS_ERRS error(s) in dmesg — HDD needs reformat, run installer" \
+        || ok "No btrfs errors"
 else
-    fail "/mnt/storage NOT mounted"
+    fail "/mnt/storage NOT mounted — run: sudo systemctl start mnt-storage.mount"
 fi
 
-# Docker
-echo -e "\n── Docker containers ──"
-for cname in syncthing portainer octoprint; do
+echo -e "\n── Containers ──"
+for cname in syncthing portainer octoprint n8n netdata; do
     state=$(docker inspect -f '{{.State.Status}}' "$cname" 2>/dev/null || echo "not found")
-    if [[ "$state" == "running" ]]; then
-        ok "$cname running"
-    elif [[ "$state" == "not found" ]]; then
-        warn "$cname not installed"
-    else
-        fail "$cname is $state"
-    fi
+    case "$state" in
+        running)    ok   "$cname" ;;
+        not\ found) warn "$cname not installed" ;;
+        *)          fail "$cname is $state — run: docker start $cname" ;;
+    esac
 done
 
-# Syncthing access
 echo -e "\n── Services ──"
-if curl -sf http://localhost:8384 -o /dev/null; then
-    ok "Syncthing UI reachable (port 8384)"
-else
-    fail "Syncthing UI not reachable"
-fi
-if curl -sf http://localhost:9000 -o /dev/null; then
-    ok "Portainer UI reachable (port 9000)"
-else
-    warn "Portainer not reachable (may not be installed)"
-fi
-if curl -sf http://localhost:5000 -o /dev/null; then
-    ok "OctoPrint UI reachable (port 5000)"
-else
-    warn "OctoPrint not reachable (may not be installed)"
-fi
+curl -sf --max-time 3 http://localhost:8384  -o /dev/null && ok  "Syncthing  :8384"  || fail "Syncthing  :8384"
+curl -sf --max-time 3 http://localhost:9000  -o /dev/null && ok  "Portainer  :9000"  || warn "Portainer  :9000"
+curl -sf --max-time 3 http://localhost:5000  -o /dev/null && ok  "OctoPrint  :5000"  || warn "OctoPrint  :5000"
+curl -sf --max-time 3 http://localhost:5678  -o /dev/null && ok  "n8n        :5678"  || warn "n8n        :5678"
+curl -sf --max-time 3 http://localhost:19999 -o /dev/null && ok  "Netdata    :19999" || warn "Netdata    :19999"
+systemctl is-active smbd &>/dev/null && ok "Samba" || fail "Samba not running"
 
-# Samba
-if systemctl is-active smbd &>/dev/null; then
-    ok "Samba running"
-else
-    fail "Samba not running"
-fi
+echo -e "\n── Syncthing volume ──"
+docker exec syncthing ls /storage/Workplace &>/dev/null \
+    && ok "Syncthing sees /storage/Workplace" \
+    || fail "Syncthing cannot see volume — run: docker restart syncthing"
 
-# Memory
 echo -e "\n── Memory ──"
 free -h | grep -E "Mem|Swap"
 
 echo ""
-if [[ $ISSUES -eq 0 ]]; then
-    echo -e "${GREEN}All checks passed.${RESET}"
-else
-    echo -e "${RED}$ISSUES issue(s) found.${RESET}"
-fi
+[[ $ISSUES -eq 0 ]] && echo -e "${GREEN}All checks passed.${RESET}" \
+                     || echo -e "${RED}$ISSUES issue(s) found.${RESET}"
 HEALTH
-chmod +x "$HEALTH_SCRIPT"
-success "Health check → $HEALTH_SCRIPT"
 
-# ── status script ─────────────────────────────────────────────────────────────
-STATUS_SCRIPT="/usr/local/bin/naviyantra-status.sh"
-cat > "$STATUS_SCRIPT" << 'STATUS'
+cat > /usr/local/bin/naviyantra-status.sh << 'STATUS'
 #!/usr/bin/env bash
-# Naviyantra quick status overview
-echo ""
-echo "═══════════════════════════════════════════"
-echo "  Naviyantra NAS — Quick Status"
-echo "═══════════════════════════════════════════"
-echo ""
-echo "── Mounts ──────────────────────────────────"
+CYAN='\033[0;36m'; BOLD='\033[1m'; RESET='\033[0m'
+PI_IP=$(hostname -I | awk '{print $1}')
+echo -e "\n${BOLD}${CYAN}Naviyantra NAS — $(date '+%H:%M:%S')${RESET}"
+echo -e "\n── Mounts ──"
 mount | grep -E "/mnt/(storage|usb)" || echo "  (none)"
-echo ""
-echo "── Docker containers ───────────────────────"
-docker ps --format "table {{.Names}}\t{{.Status}}\t{{.Ports}}" 2>/dev/null || echo "  Docker not running"
-echo ""
-echo "── Disk usage ──────────────────────────────"
+echo -e "\n── Containers ──"
+docker ps --format "  {{.Names}}\t{{.Status}}\t{{.Ports}}" 2>/dev/null | column -t -s $'\t' || echo "  Docker not running"
+echo -e "\n── Disk ──"
 df -h /mnt/storage 2>/dev/null || echo "  HDD not mounted"
-echo ""
-echo "── USB drives ──────────────────────────────"
-lsblk -o NAME,FSTYPE,LABEL,SIZE,MOUNTPOINT | grep -v "^loop" || true
-echo ""
-echo "── Memory ──────────────────────────────────"
-free -h
-echo ""
-echo "── Service ports ───────────────────────────"
-ss -tlnp | grep -E ":(8384|9000|9443|5000|5678|445|139)" || echo "  none found"
+echo -e "\n── Memory ──"
+free -h | grep -E "Mem|Swap"
+echo -e "\n── URLs ──"
+echo "  Syncthing  → http://$PI_IP:8384"
+echo "  Portainer  → http://$PI_IP:9000"
+echo "  OctoPrint  → http://$PI_IP:5000"
+echo "  n8n        → http://$PI_IP:5678"
+echo "  Netdata    → http://$PI_IP:19999"
 echo ""
 STATUS
-chmod +x "$STATUS_SCRIPT"
-success "Status script → $STATUS_SCRIPT"
+
+chmod +x /usr/local/bin/naviyantra-health.sh /usr/local/bin/naviyantra-status.sh
+ln -sf /usr/local/bin/naviyantra-health.sh /usr/local/bin/naviyantra-health
+ln -sf /usr/local/bin/naviyantra-status.sh /usr/local/bin/naviyantra-status
+success "naviyantra-health and naviyantra-status installed"
 
 # =============================================================================
-# SECTION 14 — RESTART DOCKER (ensure mounts are visible)
+# SECTION 19 — FINAL RESTART
 # =============================================================================
 
-section "14 · Restarting Docker to refresh volume mounts"
+section "19 · Final restart"
 
+systemctl daemon-reload
 systemctl restart docker
+sleep 8
+
+for cname in syncthing portainer octoprint n8n netdata; do
+    docker start "$cname" 2>/dev/null && info "  started: $cname" || warn "  skipped: $cname"
+done
+
 sleep 5
-docker start syncthing portainer octoprint 2>/dev/null || true
-success "Docker restarted and containers resumed"
 
 # =============================================================================
-# FINAL SUMMARY
+# SUMMARY
 # =============================================================================
 
-# Detect Pi's IP
 PI_IP=$(hostname -I | awk '{print $1}')
 
-echo ""
+echo "" | tee -a "$LOG_FILE"
 echo -e "${BOLD}${GREEN}"
 echo "╔══════════════════════════════════════════════════════════════╗"
-echo "║          Naviyantra NAS — Installation Complete              ║"
+echo "║       Naviyantra NAS v2.0 — Installation Complete           ║"
 echo "╚══════════════════════════════════════════════════════════════╝"
 echo -e "${RESET}"
-echo -e "${CYAN}Pi IP address   :${RESET} $PI_IP"
+echo -e "${CYAN}Pi IP        :${RESET} $PI_IP"
 echo ""
-echo -e "${CYAN}Service URLs    :${RESET}"
-echo "  Syncthing   →  http://$PI_IP:8384"
-echo "  Portainer   →  http://$PI_IP:9000"
-echo "  OctoPrint   →  http://$PI_IP:5000"
-echo "  n8n         →  http://$PI_IP:5678  (admin / naviyantra123)"
+echo -e "${CYAN}Services     :${RESET}"
+echo "  Syncthing  →  http://$PI_IP:8384"
+echo "  Portainer  →  http://$PI_IP:9000"
+echo "  OctoPrint  →  http://$PI_IP:5000"
+echo "  n8n        →  http://$PI_IP:5678   (admin / naviyantra123)"
+echo "  Netdata    →  http://$PI_IP:19999"
 echo ""
-echo -e "${CYAN}Samba share     :${RESET}"
-echo "  \\\\$PI_IP\\Storage       (Linux: smb://$PI_IP/Storage)"
-echo "  \\\\$PI_IP\\Printer"
-echo "  User: $PI_USER  |  Password: see smbpasswd warning above"
+echo -e "${CYAN}Samba        :${RESET}"
+echo "  smb://$PI_IP/Storage   (user: $PI_USER / naviyantra123)"
+echo "  smb://$PI_IP/Printer"
 echo ""
-echo -e "${CYAN}Key paths       :${RESET}"
-echo "  HDD mount   :  $MOUNT_POINT"
-echo "  Workplace   :  $MOUNT_POINT/Workplace"
-echo "  Printer     :  $MOUNT_POINT/printer"
-echo "  USB drives  :  $USB_BASE/<label>"
+echo -e "${CYAN}Boot order   :${RESET} HDD → Docker → Containers (systemd guaranteed)"
+echo -e "${CYAN}Installer    :${RESET} $MOUNT_POINT/install_naviyantra.sh"
 echo ""
-echo -e "${CYAN}Syncthing setup :${RESET}"
-echo "  1. Open http://$PI_IP:8384 in browser"
-echo "  2. Add folder path: /storage/Workplace"
-echo "  3. Set folder type: Receive Only (on Pi)"
-echo "  4. On Fedora: Send Only, path /home/atharva/Workplace"
+echo -e "${CYAN}Syncthing    :${RESET}"
+echo "  Pi path    : /storage/Workplace  → set as Receive Only"
+echo "  Fedora path: /home/atharva/Workplace  → set as Send Only"
+echo "  Ignore file: pre-written (.venv, node_modules, __pycache__ blocked)"
 echo ""
-echo -e "${CYAN}Useful commands :${RESET}"
-echo "  naviyantra-health   — full health check"
-echo "  naviyantra-status   — quick overview"
-echo "  naviyantra-uninstall — remove everything"
-echo "  docker restart syncthing  — if HDD remounted after boot"
-echo "  sudo smbpasswd $PI_USER   — change Samba password"
+echo -e "${CYAN}Commands     :${RESET}"
+echo "  naviyantra-health          — full health check with btrfs error detection"
+echo "  naviyantra-status          — quick overview + URLs"
+echo "  sudo smbpasswd $PI_USER    — change Samba password"
+echo "  docker restart syncthing   — if volumes lost after unexpected remount"
+echo "  sudo bash $MOUNT_POINT/install_naviyantra.sh — re-run from HDD"
 echo ""
-echo -e "${CYAN}Log file        :${RESET} $LOG_FILE"
-echo ""
-
-# Append summary to log
+echo -e "${CYAN}Log          :${RESET} $LOG_FILE"
+echo "" | tee -a "$LOG_FILE"
 echo "Installation completed at $(date)" >> "$LOG_FILE"
