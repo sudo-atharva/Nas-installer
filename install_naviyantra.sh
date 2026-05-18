@@ -166,8 +166,25 @@ elif [[ "$DRIVE_FSTYPE" != "btrfs" ]]; then
 else
     info "Running btrfs integrity check..."
     if ! btrfs check --readonly "$DRIVE_DEV" &>/dev/null 2>&1; then
-        warn "btrfs check FAILED — filesystem corrupted — reformatting"
+        warn "btrfs check FAILED — filesystem corrupted"
+        # ── DATA SAFETY GATE ─────────────────────────────────────────────────
+        # Mount read-only first to check if data is accessible before wiping
+        mkdir -p "$MOUNT_POINT"
+        if mount -t btrfs -o ro,usebackuproot "$DRIVE_DEV" "$MOUNT_POINT" &>/dev/null; then
+            FILE_COUNT=$(find "$MOUNT_POINT" -maxdepth 2 -not -path "*/docker/*" \
+                         -not -name ".*" -type f 2>/dev/null | wc -l || echo 0)
+            umount "$MOUNT_POINT" 2>/dev/null || true
+            if [[ "$FILE_COUNT" -gt 0 ]]; then
+                error "REFORMAT BLOCKED — drive has $FILE_COUNT file(s) that would be lost.\n\
+       If you truly want to wipe, set FORCE_REFORMAT=1 at the top of this script.\n\
+       If you want to recover data first, run:\n\
+         sudo mount -t btrfs -o ro,usebackuproot /dev/$( basename $DRIVE_DEV ) /mnt/storage\n\
+         cp -r /mnt/storage/* /home/pi/recovered/"
+            fi
+        fi
+        warn "Drive is corrupted but appears empty — reformatting"
         NEEDS_FORMAT=1
+        # ─────────────────────────────────────────────────────────────────────
     else
         success "btrfs filesystem healthy — skipping reformat"
     fi
@@ -311,20 +328,35 @@ success "USB automount ready"
 section "9 · Directories & permissions"
 
 DIRS=(
-    "$MOUNT_POINT/Workplace"
+    # ── Docker config ──────────────────────────────────────────
     "$MOUNT_POINT/docker/syncthing/config"
     "$MOUNT_POINT/docker/portainer/data"
     "$MOUNT_POINT/docker/octoprint/config"
     "$MOUNT_POINT/docker/n8n/data"
     "$MOUNT_POINT/docker/netdata/config"
-    "$MOUNT_POINT/backups/code_backup"
-    "$MOUNT_POINT/backups/doc_backup"
+
+    # ── System dirs ────────────────────────────────────────────
     "$MOUNT_POINT/printer/uploads"
     "$MOUNT_POINT/printer/timelapses"
-    "$MOUNT_POINT/downloads"
     "$MOUNT_POINT/n8n"
     "$MOUNT_POINT/homepage"
     "$USB_BASE"
+
+    # ── Root-level folders — mirrors /home/atharva/Workplace ──
+    "$MOUNT_POINT/Archive"
+    "$MOUNT_POINT/Assets"
+    "$MOUNT_POINT/Backups"
+    "$MOUNT_POINT/Documents"
+    "$MOUNT_POINT/Downloads"
+    "$MOUNT_POINT/exports"
+    "$MOUNT_POINT/freecad"
+    "$MOUNT_POINT/Games"
+    "$MOUNT_POINT/media"
+    "$MOUNT_POINT/Photos"
+    "$MOUNT_POINT/Projects"
+    "$MOUNT_POINT/temp"
+    "$MOUNT_POINT/Videos"
+    "$MOUNT_POINT/Virtual_Machines"
 )
 
 for d in "${DIRS[@]}"; do
@@ -408,7 +440,7 @@ success "Syncthing started"
 info "Writing Syncthing ignore patterns..."
 sleep 5   # let container init
 
-STIGNORE="$MOUNT_POINT/Workplace/.stignore"
+STIGNORE="$MOUNT_POINT/.stignore"
 cat > "$STIGNORE" << 'IGNORE'
 // Naviyantra — Syncthing ignore patterns
 // These paths are NEVER synced to/from this device
@@ -463,8 +495,8 @@ chmod 664 "$STIGNORE"
 success "Syncthing .stignore written"
 
 sleep 3
-docker exec syncthing ls /storage/Workplace &>/dev/null \
-    && success "Syncthing sees /storage/Workplace ✓" \
+docker exec syncthing ls /storage &>/dev/null \
+    && success "Syncthing sees /storage ✓" \
     || warn "Volume check pending — run: docker restart syncthing if UI shows error"
 
 # =============================================================================
@@ -678,8 +710,8 @@ curl -sf --max-time 3 http://localhost:19999 -o /dev/null && ok  "Netdata    :19
 systemctl is-active smbd &>/dev/null && ok "Samba" || fail "Samba not running"
 
 echo -e "\n── Syncthing volume ──"
-docker exec syncthing ls /storage/Workplace &>/dev/null \
-    && ok "Syncthing sees /storage/Workplace" \
+docker exec syncthing ls /storage &>/dev/null \
+    && ok "Syncthing sees /storage" \
     || fail "Syncthing cannot see volume — run: docker restart syncthing"
 
 echo -e "\n── Memory ──"
@@ -762,8 +794,8 @@ echo -e "${CYAN}Boot order   :${RESET} HDD → Docker → Containers (systemd gu
 echo -e "${CYAN}Installer    :${RESET} $MOUNT_POINT/install_naviyantra.sh"
 echo ""
 echo -e "${CYAN}Syncthing    :${RESET}"
-echo "  Pi path    : /storage/Workplace  → set as Receive Only"
-echo "  Fedora path: /home/atharva/Workplace  → set as Send Only"
+echo "  Pi path    : /storage  → set as Receive Only"
+echo "  Fedora path: /home/atharva/Workplace  → set as Send Only (maps to /storage root)"
 echo "  Ignore file: pre-written (.venv, node_modules, __pycache__ blocked)"
 echo ""
 echo -e "${CYAN}Commands     :${RESET}"
